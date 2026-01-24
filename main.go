@@ -16,12 +16,10 @@ import (
 )
 
 // --- КОНФИГУРАЦИЯ ---
-// ID таблицы можно оставить хардкодом, это не секрет, но лучше тоже вынести в ENV
 const SpreadsheetID = "1TiB-811WjRvkKYKCv6Wf-zz8J9MRxL3bzLIYosML6Cc"
 const SheetBooking = "Booking"
 const SheetUsers = "Users"
 
-// Диапазоны
 const DaysRange = "B1:H1"
 const TimesRange = "A2:A10"
 const DataStartRow = 2
@@ -51,29 +49,23 @@ var (
 )
 
 func main() {
-	// 0. Загрузка переменных окружения (для локального запуска из файла .env)
-	// Если файла нет (например, на сервере), ошибка просто логируется, код не падает
 	if err := godotenv.Load(); err != nil {
 		log.Println("Инфо: файл .env не найден, используем системные переменные")
 	}
 
-	// 1. Google Sheets (ЧЕРЕЗ ПЕРЕМЕННУЮ ОКРУЖЕНИЯ)
 	ctx := context.Background()
 
-	// Получаем JSON-строку с ключами
 	credsJSON := os.Getenv("GOOGLE_CREDENTIALS")
 	if credsJSON == "" {
 		log.Fatal("ОШИБКА: Переменная окружения GOOGLE_CREDENTIALS пуста!")
 	}
 
 	var err error
-	// Используем WithCredentialsJSON вместо WithCredentialsFile
 	srv, err = sheets.NewService(ctx, option.WithCredentialsJSON([]byte(credsJSON)))
 	if err != nil {
 		log.Fatalf("Ошибка API Sheets: %v", err)
 	}
 
-	// 2. Telegram
 	botToken := os.Getenv("API_TOKEN")
 	if botToken == "" {
 		log.Fatal("ОШИБКА: Переменная API_TOKEN пуста!")
@@ -90,7 +82,6 @@ func main() {
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	// 3. Цикл обработки сообщений
 	for update := range updates {
 		if update.CallbackQuery != nil {
 			handleCallback(bot, update.CallbackQuery)
@@ -115,7 +106,6 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if text == "/start" {
 		session.State = StateNone
 
-		// Проверяем БД
 		name, sid, found := checkUserInDB(tgID)
 		if found {
 			session.RealName = name
@@ -132,7 +122,6 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	// Команда /my
 	if text == "/my" {
 		if session.RealName == "" || session.StudentID == "" {
-			// Пытаемся восстановить сессию
 			name, sid, found := checkUserInDB(tgID)
 			if !found {
 				sendHTML(bot, chatID, "First, write /start for registration.")
@@ -154,7 +143,6 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	case StateWaitingStudentID:
 		studentID := text
-		// Сохраняем
 		saveUserToDB(tgID, session.TempName, studentID)
 
 		session.RealName = session.TempName
@@ -174,11 +162,9 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 // --- ЛОГИКА КНОПОК ---
 
 func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
-	// Обязательно отвечаем на коллбэк, чтобы убрать часики загрузки
 	bot.Request(tgbotapi.NewCallback(cb.ID, ""))
 
 	session := getSession(cb.From.ID)
-	// Восстановление сессии если бот перезагружался
 	if session.RealName == "" {
 		name, sid, found := checkUserInDB(cb.From.ID)
 		if !found {
@@ -209,15 +195,18 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
 		colIdx, _ := strconv.Atoi(parts[1])
 		rowIdx, _ := strconv.Atoi(parts[2])
 
-		// Формируем уникальную запись: Name (StudentID)
 		uniqueName := fmt.Sprintf("%s (%s)", session.RealName, session.StudentID)
 
 		success, msg := bookSlot(colIdx, rowIdx, uniqueName)
 		if success {
-			// Если успешно - редактируем текст сообщения на успех
-			editHTML(bot, chatID, msgID, msg, nil)
+			successKb := tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("📋 My Slots", "show_my_slots"),
+					tgbotapi.NewInlineKeyboardButtonData("➕ Book another", "add_slot"),
+				),
+			)
+			editHTML(bot, chatID, msgID, msg, &successKb)
 		} else {
-			// Если ошибка (занято) - показываем алерт и обновляем кнопки
 			bot.Request(tgbotapi.NewCallbackWithAlert(cb.ID, msg))
 			sendTimeSelection(bot, chatID, msgID, colIdx)
 		}
@@ -227,13 +216,8 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
 	// 3. Удаление
 	if strings.HasPrefix(data, "del_") {
 		cellA1 := strings.TrimPrefix(data, "del_")
-		// Удаляем
 		deleteSlot(cellA1)
-
-		// Пишем "Удалено" вместо списка
 		editHTML(bot, chatID, msgID, "🗑 Slot deleted!", nil)
-
-		// Сразу же показываем обновленный список новым сообщением
 		sendMySlots(bot, chatID, session.RealName, session.StudentID)
 		return
 	}
@@ -247,6 +231,12 @@ func handleCallback(bot *tgbotapi.BotAPI, cb *tgbotapi.CallbackQuery) {
 	if data == "back_days" {
 		bot.Send(tgbotapi.NewDeleteMessage(chatID, msgID))
 		sendDaySelection(bot, chatID)
+		return
+	}
+
+	if data == "show_my_slots" {
+		bot.Send(tgbotapi.NewDeleteMessage(chatID, msgID))
+		sendMySlots(bot, chatID, session.RealName, session.StudentID)
 		return
 	}
 }
@@ -289,7 +279,6 @@ func sendDaySelection(bot *tgbotapi.BotAPI, chatID int64) {
 func sendTimeSelection(bot *tgbotapi.BotAPI, chatID int64, msgID int, colIdx int) {
 	colLetter := getColumnLetter(colIdx)
 
-	// Читаем время (A) и Записи (Выбранный столбец)
 	respTime, err1 := srv.Spreadsheets.Values.Get(SpreadsheetID, fmt.Sprintf("%s!%s", SheetBooking, TimesRange)).Do()
 	rangeSlots := fmt.Sprintf("%s!%s%d:%s%d", SheetBooking, colLetter, DataStartRow, colLetter, DataEndRow)
 	respSlots, err2 := srv.Spreadsheets.Values.Get(SpreadsheetID, rangeSlots).Do()
@@ -357,42 +346,48 @@ func sendMySlots(bot *tgbotapi.BotAPI, chatID int64, name, sid string) {
 		return
 	}
 
-	data := resp.Values
+	data := resp.Values // data[row][col]
 	var msgText strings.Builder
 	msgText.WriteString(fmt.Sprintf("👤 <b>%s</b>\n📋 <b>Your slots:</b>\n\n", uniqueName))
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	foundCount := 0
 
-	// data[0] = заголовки дней
-	// data[row][0] = время
-	for r := 1; r < len(data); r++ {
-		for c := 1; c < len(data[r]); c++ {
-			val := fmt.Sprintf("%v", data[r][c])
+	if len(data) > 0 {
+		maxCols := len(data[0])
 
-			// СРАВНИВАЕМ ПОЛНУЮ СТРОКУ С ID
-			if strings.TrimSpace(val) == uniqueName {
-				foundCount++
+		for c := 1; c < maxCols; c++ {
+			for r := 1; r < len(data); r++ {
 
-				dayName := "Day"
-				if len(data[0]) > c {
-					dayName = fmt.Sprintf("%v", data[0][c])
+				if c >= len(data[r]) {
+					continue
 				}
 
-				timeLabel := "Time"
-				if len(data[r]) > 0 {
-					timeLabel = fmt.Sprintf("%v", data[r][0])
+				val := fmt.Sprintf("%v", data[r][c])
+
+				if strings.TrimSpace(val) == uniqueName {
+					foundCount++
+
+					dayName := "Day"
+					if len(data[0]) > c {
+						dayName = fmt.Sprintf("%v", data[0][c])
+					}
+
+					timeLabel := "Time"
+					if len(data[r]) > 0 {
+						timeLabel = fmt.Sprintf("%v", data[r][0])
+					}
+
+					msgText.WriteString(fmt.Sprintf("%d. <b>%s</b>: %s\n", foundCount, dayName, timeLabel))
+
+					colLetter := getColumnLetter(c + 1)
+					cellA1 := fmt.Sprintf("%s%d", colLetter, r+1)
+
+					btnText := fmt.Sprintf("❌ Delete №%d (%s)", foundCount, dayName)
+					rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+						tgbotapi.NewInlineKeyboardButtonData(btnText, "del_"+cellA1),
+					))
 				}
-
-				msgText.WriteString(fmt.Sprintf("%d. <b>%s</b>: %s\n", foundCount, dayName, timeLabel))
-
-				colLetter := getColumnLetter(c + 1)
-				cellA1 := fmt.Sprintf("%s%d", colLetter, r+1)
-
-				btnText := fmt.Sprintf("❌ Delete №%d", foundCount)
-				rows = append(rows, tgbotapi.NewInlineKeyboardRow(
-					tgbotapi.NewInlineKeyboardButtonData(btnText, "del_"+cellA1),
-				))
 			}
 		}
 	}
@@ -438,7 +433,7 @@ func checkUserInDB(tgID int64) (string, string, bool) {
 	}
 	tgIDStr := strconv.FormatInt(tgID, 10)
 	for _, row := range resp.Values {
-		if len(row) > 2 { // Ожидаем: ID, Name, StudentID
+		if len(row) > 2 {
 			if fmt.Sprintf("%v", row[0]) == tgIDStr {
 				return fmt.Sprintf("%v", row[1]), fmt.Sprintf("%v", row[2]), true
 			}
